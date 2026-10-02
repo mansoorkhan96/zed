@@ -33,6 +33,7 @@ pub struct GitPanelSettings {
     pub compact_graph: bool,
     pub starts_open: bool,
     pub commit_title_max_length: usize,
+    pub show_commit_section: bool,
     pub entry_primary_click_action: GitPanelClickBehavior,
     pub commit_editor: GitPanelCommitEditor,
 }
@@ -84,6 +85,7 @@ impl Settings for GitPanelSettings {
             compact_graph: git_panel.compact_graph.unwrap(),
             starts_open: git_panel.starts_open.unwrap(),
             commit_title_max_length: git_panel.commit_title_max_length.unwrap(),
+            show_commit_section: git_panel.show_commit_section.unwrap(),
             entry_primary_click_action: git_panel.entry_primary_click_action.unwrap(),
             commit_editor: git_panel.commit_editor.unwrap(),
         }
