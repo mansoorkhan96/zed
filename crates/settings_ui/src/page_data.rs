@@ -6514,6 +6514,29 @@ fn panels_page() -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Show Commit Section",
+                description: "Whether to show the commit message area",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("git_panel.show_commit_section"),
+                    pick: |settings_content| {
+                        settings_content
+                            .git_panel
+                            .as_ref()?
+                            .show_commit_section
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .git_panel
+                            .get_or_insert_default()
+                            .show_commit_section = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Git Panel Default Width",
                 description: "Default width of the Git panel in pixels.",
                 field: Box::new(SettingField {
