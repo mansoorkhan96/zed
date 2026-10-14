@@ -3168,81 +3168,76 @@ pub fn render_diff_hunk_controls(
     let supports_restore = operations
         .as_ref()
         .is_some_and(|operations| operations.supports_restore());
+    let show_stage_or_unstage = show_stage_restore
+        && ((status.has_secondary_hunk() && supports_staging)
+            || (!status.has_secondary_hunk() && supports_unstaging));
+    let show_restore = show_stage_restore && supports_restore;
+    let show_hunk_navigation =
+        !compact_hunk_controls(cx) && !editor.read(cx).buffer().read(cx).all_diff_hunks_expanded();
 
-    let supports_stage_control = if status.has_secondary_hunk() {
-        supports_staging
-    } else {
-        supports_unstaging
-    };
-    let compact = compact_hunk_controls(cx);
-    if compact && !(show_stage_restore && (supports_stage_control || supports_restore)) {
+    if !show_stage_or_unstage && !show_restore && !show_hunk_navigation {
         return gpui::Empty.into_any_element();
     }
 
     diff_hunk_controls_container(row_count, line_height, cx)
-        .when(
-            show_stage_restore
-                && ((status.has_secondary_hunk() && supports_staging)
-                    || (!status.has_secondary_hunk() && supports_unstaging)),
-            |el| {
-                el.child(if status.has_secondary_hunk() {
-                    HunkControlButton::new(("stage", row as u64), "Stage", IconName::Plus, cx)
-                        .alpha(if status.is_pending() { 0.66 } else { 1.0 })
-                        .tooltip({
-                            let focus_handle = editor.focus_handle(cx);
-                            move |_window, cx| {
-                                Tooltip::for_action_in(
-                                    "Stage Hunk",
-                                    &::git::ToggleStaged,
-                                    &focus_handle,
+        .when(show_stage_or_unstage, |el| {
+            el.child(if status.has_secondary_hunk() {
+                HunkControlButton::new(("stage", row as u64), "Stage", IconName::Plus, cx)
+                    .alpha(if status.is_pending() { 0.66 } else { 1.0 })
+                    .tooltip({
+                        let focus_handle = editor.focus_handle(cx);
+                        move |_window, cx| {
+                            Tooltip::for_action_in(
+                                "Stage Hunk",
+                                &::git::ToggleStaged,
+                                &focus_handle,
+                                cx,
+                            )
+                        }
+                    })
+                    .on_click({
+                        let editor = editor.clone();
+                        move |_event, window, cx| {
+                            editor.update(cx, |editor, cx| {
+                                editor.stage_or_unstage_diff_hunks(
+                                    true,
+                                    vec![hunk_range.start..hunk_range.start],
+                                    window,
                                     cx,
-                                )
-                            }
-                        })
-                        .on_click({
-                            let editor = editor.clone();
-                            move |_event, window, cx| {
-                                editor.update(cx, |editor, cx| {
-                                    editor.stage_or_unstage_diff_hunks(
-                                        true,
-                                        vec![hunk_range.start..hunk_range.start],
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            }
-                        })
-                } else {
-                    HunkControlButton::new(("unstage", row as u64), "Unstage", IconName::Dash, cx)
-                        .alpha(if status.is_pending() { 0.66 } else { 1.0 })
-                        .tooltip({
-                            let focus_handle = editor.focus_handle(cx);
-                            move |_window, cx| {
-                                Tooltip::for_action_in(
-                                    "Unstage Hunk",
-                                    &::git::ToggleStaged,
-                                    &focus_handle,
+                                );
+                            });
+                        }
+                    })
+            } else {
+                HunkControlButton::new(("unstage", row as u64), "Unstage", IconName::Dash, cx)
+                    .alpha(if status.is_pending() { 0.66 } else { 1.0 })
+                    .tooltip({
+                        let focus_handle = editor.focus_handle(cx);
+                        move |_window, cx| {
+                            Tooltip::for_action_in(
+                                "Unstage Hunk",
+                                &::git::ToggleStaged,
+                                &focus_handle,
+                                cx,
+                            )
+                        }
+                    })
+                    .on_click({
+                        let editor = editor.clone();
+                        move |_event, window, cx| {
+                            editor.update(cx, |editor, cx| {
+                                editor.stage_or_unstage_diff_hunks(
+                                    false,
+                                    vec![hunk_range.start..hunk_range.start],
+                                    window,
                                     cx,
-                                )
-                            }
-                        })
-                        .on_click({
-                            let editor = editor.clone();
-                            move |_event, window, cx| {
-                                editor.update(cx, |editor, cx| {
-                                    editor.stage_or_unstage_diff_hunks(
-                                        false,
-                                        vec![hunk_range.start..hunk_range.start],
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            }
-                        })
-                })
-            },
-        )
-        .when(show_stage_restore && supports_restore, |el| {
+                                );
+                            });
+                        }
+                    })
+            })
+        })
+        .when(show_restore, |el| {
             el.child(
                 HunkControlButton::new(("restore", row as u64), "Restore", IconName::Undo, cx)
                     .tooltip({
@@ -3269,78 +3264,73 @@ pub fn render_diff_hunk_controls(
                     .disabled(is_created_file),
             )
         })
-        .when(
-            !compact && !editor.read(cx).buffer().read(cx).all_diff_hunks_expanded(),
-            |el| {
-                el.child(
-                    IconButton::new(("next-hunk", row as u64), IconName::ArrowDown)
-                        .shape(IconButtonShape::Square)
-                        .icon_size(IconSize::Small)
-                        // .disabled(!has_multiple_hunks)
-                        .tooltip({
-                            let focus_handle = editor.focus_handle(cx);
-                            move |_window, cx| {
-                                Tooltip::for_action_in("Next Hunk", &GoToHunk, &focus_handle, cx)
-                            }
-                        })
-                        .on_click({
-                            let editor = editor.clone();
-                            move |_event, window, cx| {
-                                editor.update(cx, |editor, cx| {
-                                    let snapshot = editor.snapshot(window, cx);
-                                    let position =
-                                        hunk_range.end.to_point(&snapshot.buffer_snapshot());
-                                    editor.go_to_hunk_before_or_after_position(
-                                        &snapshot,
-                                        position,
-                                        Direction::Next,
-                                        true,
-                                        window,
-                                        cx,
-                                    );
-                                    editor.expand_selected_diff_hunks(cx);
-                                });
-                            }
-                        }),
-                )
-                .child(
-                    IconButton::new(("prev-hunk", row as u64), IconName::ArrowUp)
-                        .shape(IconButtonShape::Square)
-                        .icon_size(IconSize::Small)
-                        // .disabled(!has_multiple_hunks)
-                        .tooltip({
-                            let focus_handle = editor.focus_handle(cx);
-                            move |_window, cx| {
-                                Tooltip::for_action_in(
-                                    "Previous Hunk",
-                                    &GoToPreviousHunk,
-                                    &focus_handle,
+        .when(show_hunk_navigation, |el| {
+            el.child(
+                IconButton::new(("next-hunk", row as u64), IconName::ArrowDown)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::Small)
+                    // .disabled(!has_multiple_hunks)
+                    .tooltip({
+                        let focus_handle = editor.focus_handle(cx);
+                        move |_window, cx| {
+                            Tooltip::for_action_in("Next Hunk", &GoToHunk, &focus_handle, cx)
+                        }
+                    })
+                    .on_click({
+                        let editor = editor.clone();
+                        move |_event, window, cx| {
+                            editor.update(cx, |editor, cx| {
+                                let snapshot = editor.snapshot(window, cx);
+                                let position = hunk_range.end.to_point(&snapshot.buffer_snapshot());
+                                editor.go_to_hunk_before_or_after_position(
+                                    &snapshot,
+                                    position,
+                                    Direction::Next,
+                                    true,
+                                    window,
                                     cx,
-                                )
-                            }
-                        })
-                        .on_click({
-                            let editor = editor.clone();
-                            move |_event, window, cx| {
-                                editor.update(cx, |editor, cx| {
-                                    let snapshot = editor.snapshot(window, cx);
-                                    let point =
-                                        hunk_range.start.to_point(&snapshot.buffer_snapshot());
-                                    editor.go_to_hunk_before_or_after_position(
-                                        &snapshot,
-                                        point,
-                                        Direction::Prev,
-                                        true,
-                                        window,
-                                        cx,
-                                    );
-                                    editor.expand_selected_diff_hunks(cx);
-                                });
-                            }
-                        }),
-                )
-            },
-        )
+                                );
+                                editor.expand_selected_diff_hunks(cx);
+                            });
+                        }
+                    }),
+            )
+            .child(
+                IconButton::new(("prev-hunk", row as u64), IconName::ArrowUp)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::Small)
+                    // .disabled(!has_multiple_hunks)
+                    .tooltip({
+                        let focus_handle = editor.focus_handle(cx);
+                        move |_window, cx| {
+                            Tooltip::for_action_in(
+                                "Previous Hunk",
+                                &GoToPreviousHunk,
+                                &focus_handle,
+                                cx,
+                            )
+                        }
+                    })
+                    .on_click({
+                        let editor = editor.clone();
+                        move |_event, window, cx| {
+                            editor.update(cx, |editor, cx| {
+                                let snapshot = editor.snapshot(window, cx);
+                                let point = hunk_range.start.to_point(&snapshot.buffer_snapshot());
+                                editor.go_to_hunk_before_or_after_position(
+                                    &snapshot,
+                                    point,
+                                    Direction::Prev,
+                                    true,
+                                    window,
+                                    cx,
+                                );
+                                editor.expand_selected_diff_hunks(cx);
+                            });
+                        }
+                    }),
+            )
+        })
         .into_any_element()
 }
 
