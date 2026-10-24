@@ -8250,6 +8250,9 @@ impl GitPanel {
             ElementId::Name(format!("entry_{}_{}_checkbox_wrapper", display_name, ix).into());
         let checkbox_id: ElementId =
             ElementId::Name(format!("entry_{}_{}_checkbox", display_name, ix).into());
+        let open_file_button_id: ElementId =
+            ElementId::Name(format!("entry_{}_{}_open_file", display_name, ix).into());
+        let group_name: SharedString = format!("entry_group_{}_{}", display_name, ix).into();
 
         let stage_status = GitPanel::stage_status_for_entry(entry, &repo);
         let stage_intent = self.stage_intent_for_entry_index(ix);
@@ -8350,6 +8353,7 @@ impl GitPanel {
 
         h_flex()
             .id(id)
+            .group(group_name.clone())
             .h(self.list_item_height())
             .w_full()
             .pl_2p5()
@@ -8364,6 +8368,23 @@ impl GitPanel {
             .hover(|s| s.bg(hover_bg))
             .active(|s| s.bg(active_bg))
             .child(name_row)
+            .when(!is_deleted, |el| {
+                el.child(
+                    IconButton::new(open_file_button_id, IconName::FileTextOutlined)
+                        .icon_size(IconSize::Medium)
+                        .icon_color(Color::Muted)
+                        .visible_on_hover(group_name)
+                        .tooltip(Tooltip::for_action_title_in(
+                            "Open File",
+                            &ViewFile,
+                            &self.focus_handle,
+                        ))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.clear_marks_and_select(ix, cx);
+                            this.view_file(&ViewFile, window, cx);
+                        })),
+                )
+            })
             .when(GitPanelSettings::get_global(cx).diff_stats, |el| {
                 el.when_some(entry.diff_stat, move |this, stat| {
                     let id = format!("diff-stat-{}", id_for_diff_stat);
