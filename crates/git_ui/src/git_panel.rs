@@ -67,7 +67,8 @@ use project::git_store::GitAccess;
 use project::{
     Fs, Project, ProjectPath,
     git_store::{
-        CommitDataState, GitStoreEvent, Repository, RepositoryEvent, RepositoryId, pending_op,
+        CommitDataState, GitStoreEvent, PendingOpsUpdated, Repository, RepositoryEvent,
+        RepositoryId, pending_op,
     },
     project_settings::{GitPathStyle, ProjectSettings},
 };
@@ -596,6 +597,20 @@ fn last_op_keeps_staged_changes(ops: &pending_op::PendingOps) -> bool {
     ops.ops
         .last()
         .is_some_and(|op| op.git_status == pending_op::GitStatus::RevertedUnstaged)
+}
+
+fn pending_whole_file_staging(ops: &pending_op::PendingOps) -> Option<StageStatus> {
+    let last_op = ops.ops.last()?;
+    if last_op.error() || last_op.job_status == pending_op::JobStatus::Skipped {
+        return None;
+    }
+    match last_op.git_status {
+        pending_op::GitStatus::Staged => Some(StageStatus::Staged),
+        pending_op::GitStatus::Unstaged => Some(StageStatus::Unstaged),
+        pending_op::GitStatus::Reverted
+        | pending_op::GitStatus::RevertedUnstaged
+        | pending_op::GitStatus::Unchanged => None,
+    }
 }
 
 fn commit_history_from_response(
@@ -1238,6 +1253,7 @@ pub struct GitPanel {
     graph_section: GraphSection,
     _commit_message_buffer_subscription: Option<Subscription>,
     _repo_subscriptions: Vec<Subscription>,
+    pending_ops_subscription: Option<Subscription>,
     _settings_subscription: Subscription,
     git_access: Option<GitAccess>,
     commit_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1579,6 +1595,7 @@ impl GitPanel {
                 graph_section: GraphSection::new(!graph_section_collapsed, cx),
                 _commit_message_buffer_subscription: None,
                 _repo_subscriptions: Vec::new(),
+                pending_ops_subscription: None,
                 _settings_subscription,
                 git_access: None,
                 commit_menu_handle: PopoverMenuHandle::default(),
@@ -3637,27 +3654,24 @@ impl GitPanel {
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
+        // Started here rather than in the task so the next entries refresh sees its pending ops.
+        let task = active_repository.update(cx, |repo, cx| {
+            let repo_paths = entries
+                .iter()
+                .map(|entry| entry.repo_path.clone())
+                .unique()
+                .collect();
+            if stage {
+                repo.stage_entries(repo_paths, cx)
+            } else {
+                repo.unstage_entries(repo_paths, cx)
+            }
+        });
+        self.update_counts(active_repository.read(cx));
+        cx.notify();
         cx.spawn({
             async move |this, cx| {
-                let result = this
-                    .update(cx, |this, cx| {
-                        let task = active_repository.update(cx, |repo, cx| {
-                            let repo_paths = entries
-                                .iter()
-                                .map(|entry| entry.repo_path.clone())
-                                .unique()
-                                .collect();
-                            if stage {
-                                repo.stage_entries(repo_paths, cx)
-                            } else {
-                                repo.unstage_entries(repo_paths, cx)
-                            }
-                        });
-                        this.update_counts(active_repository.read(cx));
-                        cx.notify();
-                        task
-                    })?
-                    .await;
+                let result = task.await;
 
                 this.update(cx, |this, cx| {
                     if let Err(err) = result {
@@ -5585,6 +5599,17 @@ impl GitPanel {
             }
             self.reset_graph_section_for_repository_change(cx);
         }
+        if active_repository_changed || self.pending_ops_subscription.is_none() {
+            self.pending_ops_subscription = new_active_repository.as_ref().map(|repository| {
+                cx.subscribe_in(
+                    repository,
+                    window,
+                    |this, _, _: &PendingOpsUpdated, window, cx| {
+                        this.update_visible_entries(window, cx);
+                    },
+                )
+            });
+        }
         self.active_repository = new_active_repository;
         self.reopen_commit_buffer(window, cx);
         self.preload_commit_history(cx);
@@ -5824,10 +5849,15 @@ impl GitPanel {
                 continue;
             }
 
+            // Don't wait for the status rescan that follows the index write.
+            let pending_staging = pending_ops
+                .as_ref()
+                .and_then(pending_whole_file_staging)
+                .unwrap_or(staging);
             let entry = GitStatusEntry {
                 repo_path: status_entry.repo_path.clone(),
                 status: status_entry.status,
-                staging,
+                staging: pending_staging,
                 diff_stat: status_entry.diff_stat,
             };
 
@@ -5843,15 +5873,24 @@ impl GitPanel {
             if group_by_staging_state && is_conflict {
                 conflict_entries.push(entry);
             } else if group_by_staging_state {
-                if staging.has_staged() {
+                // A whole-file stage or unstage moves all of the file's changes to one side.
+                let (staged_diff_stat, unstaged_diff_stat) = if pending_staging == staging {
+                    (
+                        status_entry.staged_diff_stat,
+                        status_entry.unstaged_diff_stat,
+                    )
+                } else {
+                    (status_entry.diff_stat, status_entry.diff_stat)
+                };
+                if pending_staging.has_staged() {
                     staged_entries.push(GitStatusEntry {
-                        diff_stat: status_entry.staged_diff_stat,
+                        diff_stat: staged_diff_stat,
                         ..entry.clone()
                     });
                 }
-                if staging.has_unstaged() && !unstaged_reverted {
+                if pending_staging.has_unstaged() && !unstaged_reverted {
                     unstaged_entries.push(GitStatusEntry {
-                        diff_stat: status_entry.unstaged_diff_stat,
+                        diff_stat: unstaged_diff_stat,
                         ..entry
                     });
                 }
@@ -11781,6 +11820,177 @@ mod tests {
             assert_eq!(
                 panel.selected_entry,
                 panel.entry_by_path_in_section(&repo_path("partial.rs"), Section::Unstaged)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_group_by_staging_moves_entries_before_status_rescan(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "staged.rs": "staged new\n",
+                "unstaged.rs": "unstaged new\n",
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            path!("/project/.git").as_ref(),
+            &[
+                ("staged.rs", "staged old\n".into()),
+                ("unstaged.rs", "unstaged old\n".into()),
+            ],
+            "deadbeef",
+        );
+        fs.set_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[
+                ("staged.rs", "staged new\n".into()),
+                ("unstaged.rs", "unstaged old\n".into()),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().group_by =
+                        Some(GitPanelGroupBy::Staging);
+                })
+            });
+        });
+        cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        await_git_panel_entries(&panel, &mut cx).await;
+
+        let assert_sections =
+            |panel: &GitPanel, staged: &[&str], unstaged: &[&str], context: &str| {
+                for path in staged {
+                    assert!(
+                        panel
+                            .entry_by_path_in_section(&repo_path(path), Section::Staged)
+                            .is_some()
+                            && panel
+                                .entry_by_path_in_section(&repo_path(path), Section::Unstaged)
+                                .is_none(),
+                        "{context}: {path} should only be in the staged section"
+                    );
+                }
+                for path in unstaged {
+                    assert!(
+                        panel
+                            .entry_by_path_in_section(&repo_path(path), Section::Unstaged)
+                            .is_some()
+                            && panel
+                                .entry_by_path_in_section(&repo_path(path), Section::Staged)
+                                .is_none(),
+                        "{context}: {path} should only be in the unstaged section"
+                    );
+                }
+            };
+
+        panel.read_with(&cx, |panel, _| {
+            assert_sections(panel, &["staged.rs"], &["unstaged.rs"], "initial state");
+        });
+
+        // Hold back the index change notifications so the status rescan that
+        // follows a stage or unstage can't run.
+        fs.pause_events();
+        panel.update(&mut cx, |panel, cx| {
+            let status_entry = |path: &str| {
+                panel
+                    .change_entries_by_path()
+                    .find(|entry| entry.repo_path == repo_path(path))
+                    .cloned()
+                    .expect("entry should exist")
+            };
+            let unstaged_entry = status_entry("unstaged.rs");
+            let staged_entry = status_entry("staged.rs");
+            panel.change_file_stage(true, vec![unstaged_entry], cx);
+            panel.change_file_stage(false, vec![staged_entry], cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_sections(
+                panel,
+                &["unstaged.rs"],
+                &["staged.rs"],
+                "before the status rescan",
+            );
+        });
+
+        fs.unpause_events_and_flush();
+        cx.run_until_parked();
+        await_git_panel_entries(&panel, &mut cx).await;
+        panel.read_with(&cx, |panel, _| {
+            assert_sections(
+                panel,
+                &["unstaged.rs"],
+                &["staged.rs"],
+                "after the status rescan",
+            );
+        });
+
+        fs.pause_events();
+        panel.update(&mut cx, |panel, cx| {
+            panel.change_all_files_stage(true, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_sections(
+                panel,
+                &["staged.rs", "unstaged.rs"],
+                &[],
+                "stage all before the status rescan",
+            );
+        });
+
+        fs.unpause_events_and_flush();
+        cx.run_until_parked();
+        await_git_panel_entries(&panel, &mut cx).await;
+        panel.read_with(&cx, |panel, _| {
+            assert_sections(
+                panel,
+                &["staged.rs", "unstaged.rs"],
+                &[],
+                "stage all after the status rescan",
+            );
+        });
+
+        fs.pause_events();
+        panel.update(&mut cx, |panel, cx| {
+            panel.change_all_files_stage(false, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_sections(
+                panel,
+                &[],
+                &["staged.rs", "unstaged.rs"],
+                "unstage all before the status rescan",
+            );
+        });
+
+        fs.unpause_events_and_flush();
+        cx.run_until_parked();
+        await_git_panel_entries(&panel, &mut cx).await;
+        panel.read_with(&cx, |panel, _| {
+            assert_sections(
+                panel,
+                &[],
+                &["staged.rs", "unstaged.rs"],
+                "unstage all after the status rescan",
             );
         });
     }

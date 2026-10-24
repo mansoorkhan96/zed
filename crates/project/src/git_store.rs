@@ -863,6 +863,11 @@ pub enum RepositoryEvent {
 #[derive(Clone, Debug)]
 pub struct JobsUpdated;
 
+/// Not a [`RepositoryEvent`], because the git store forwards those to every subscriber and
+/// some of them (like inline blame) do expensive work on any update.
+#[derive(Clone, Debug)]
+pub struct PendingOpsUpdated;
+
 #[derive(Debug)]
 pub enum GitStoreEvent {
     ActiveRepositoryChanged(Option<RepositoryId>),
@@ -879,6 +884,7 @@ pub enum GitStoreEvent {
 
 impl EventEmitter<RepositoryEvent> for Repository {}
 impl EventEmitter<JobsUpdated> for Repository {}
+impl EventEmitter<PendingOpsUpdated> for Repository {}
 impl EventEmitter<GitStoreEvent> for GitStore {}
 
 pub struct GitJob {
@@ -10277,7 +10283,8 @@ impl Repository {
         if updated != self.pending_ops {
             cx.emit(RepositoryEvent::PendingOpsChanged {
                 pending_ops: self.pending_ops.clone(),
-            })
+            });
+            cx.emit(PendingOpsUpdated);
         }
 
         self.pending_ops = updated;
@@ -10783,6 +10790,7 @@ impl Repository {
         AsyncFn: AsyncFnOnce(WeakEntity<Repository>, &mut AsyncApp) -> Result<()> + 'static,
     {
         let ids = self.new_pending_ops_for_paths(paths, git_status);
+        cx.emit(PendingOpsUpdated);
 
         cx.spawn(async move |this, cx| {
             let (job_status, result) = match f(this.clone(), cx).await {
@@ -10791,7 +10799,7 @@ impl Repository {
                 Err(err) => (pending_op::JobStatus::Error, Err(err)),
             };
 
-            this.update(cx, |this, _| {
+            this.update(cx, |this, cx| {
                 let mut edits = Vec::with_capacity(ids.len());
                 for (id, entry) in ids {
                     if let Some(mut ops) = this
@@ -10806,6 +10814,7 @@ impl Repository {
                     }
                 }
                 this.pending_ops.edit(edits, ());
+                cx.emit(PendingOpsUpdated);
             })?;
 
             result
