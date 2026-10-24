@@ -30,7 +30,7 @@ use gpui::{
 use language::{
     Anchor, Buffer, BufferId, Capability, DiskState, OffsetRangeExt, Point, ReplicaId, TextBuffer,
 };
-use multi_buffer::{MultiBuffer, PathKey};
+use multi_buffer::{BufferOffset, MultiBuffer, PathKey};
 use project::{
     ConflictSet, Project, ProjectPath,
     git_store::{
@@ -40,7 +40,7 @@ use project::{
     image_store::is_image_file,
 };
 use settings::{GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, ops::Range, sync::Arc};
 use theme::ActiveTheme;
 use ui::{CommonAnimationExt as _, KeyBinding, prelude::*};
 use util::{ResultExt as _, rel_path::RelPath};
@@ -59,6 +59,7 @@ const IMAGE_DIFF_BLOCK_LINES: u32 = 16;
 struct BufferSubscriptions {
     _diff: Entity<BufferDiff>,
     display_buffer: Entity<Buffer>,
+    main_buffer: Entity<Buffer>,
     _diff_subscription: Subscription,
     _conflict_set: Option<Entity<ConflictSet>>,
     _conflict_set_subscription: Option<Subscription>,
@@ -511,6 +512,12 @@ impl DiffMultibuffer {
                 self._task =
                     cx.spawn_in(window, async move |this, cx| Self::refresh(this, cx).await);
             }
+            EditorEvent::OpenExcerptsRequested {
+                selections_by_buffer,
+                split,
+            } => {
+                self.open_worktree_buffers(selections_by_buffer, *split, window, cx);
+            }
 
             _ => {}
         }
@@ -519,6 +526,98 @@ impl DiffMultibuffer {
         {
             self.focus_handle.focus(window, cx)
         }
+    }
+
+    /// Opens the worktree files behind the displayed buffers. The staged diff
+    /// displays the index text, which is a detached snapshot of the file, so
+    /// positions are mapped onto the worktree buffer through its unstaged diff.
+    fn open_worktree_buffers(
+        &mut self,
+        selections_by_buffer: &HashMap<BufferId, (Vec<Range<BufferOffset>>, Option<u32>)>,
+        split: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.project().clone())
+            .ok()
+        else {
+            return;
+        };
+        let git_store = project.read(cx).git_store().clone();
+        let mut buffers_to_open = Vec::new();
+        for (display_buffer_id, (ranges, scroll_offset)) in selections_by_buffer {
+            let Some(display_buffer) = self.multibuffer.read(cx).buffer(*display_buffer_id) else {
+                continue;
+            };
+            let Some(main_buffer) = self
+                .buffer_subscriptions
+                .values()
+                .find(|subscriptions| subscriptions.display_buffer == display_buffer)
+                .map(|subscriptions| subscriptions.main_buffer.clone())
+            else {
+                continue;
+            };
+            let display_snapshot = display_buffer.read(cx).snapshot();
+            let point_ranges = ranges
+                .iter()
+                .map(|range| {
+                    display_snapshot.offset_to_point(range.start.0)
+                        ..display_snapshot.offset_to_point(range.end.0)
+                })
+                .collect::<Vec<_>>();
+            let unstaged_diff = (main_buffer != display_buffer).then(|| {
+                git_store.update(cx, |git_store, cx| {
+                    git_store.open_unstaged_diff(main_buffer.clone(), cx)
+                })
+            });
+            buffers_to_open.push((main_buffer, unstaged_diff, point_ranges, *scroll_offset));
+        }
+        if buffers_to_open.is_empty() {
+            return;
+        }
+
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let mut selections_by_buffer = HashMap::default();
+            for (main_buffer, unstaged_diff, point_ranges, scroll_offset) in buffers_to_open {
+                let unstaged_diff = match unstaged_diff {
+                    Some(task) => Some(task.await?),
+                    None => None,
+                };
+                let ranges = cx.update(|_, cx| {
+                    let main_snapshot = main_buffer.read(cx).text_snapshot();
+                    let diff_snapshot = unstaged_diff
+                        .as_ref()
+                        .map(|unstaged_diff| unstaged_diff.read(cx).snapshot(cx));
+                    let to_main_offset = |point| {
+                        let point = match &diff_snapshot {
+                            Some(diff_snapshot) => {
+                                diff_snapshot.base_text_point_to_buffer_point(point, &main_snapshot)
+                            }
+                            None => point,
+                        };
+                        BufferOffset(main_snapshot.point_to_offset(point))
+                    };
+                    point_ranges
+                        .into_iter()
+                        .map(|range| to_main_offset(range.start)..to_main_offset(range.end))
+                        .collect::<Vec<_>>()
+                })?;
+                selections_by_buffer.insert(main_buffer, (ranges, scroll_offset));
+            }
+            cx.update(|window, cx| {
+                Editor::open_buffers_in_workspace(
+                    workspace,
+                    selections_by_buffer,
+                    split,
+                    window,
+                    cx,
+                );
+            })
+        })
+        .detach_and_log_err(cx);
     }
 
     #[instrument(skip_all)]
@@ -586,6 +685,7 @@ impl DiffMultibuffer {
             BufferSubscriptions {
                 _diff: diff.clone(),
                 display_buffer: display_buffer.clone(),
+                main_buffer,
                 _diff_subscription: diff_subscription,
                 _conflict_set: conflict_set.clone(),
                 _conflict_set_subscription: conflict_set_subscription,
