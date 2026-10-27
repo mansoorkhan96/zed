@@ -91,11 +91,15 @@ impl Render for StatusToast {
                     this.pr_2p5()
                 }
             })
-            .flex_none()
+            .min_w_0()
             .bg(cx.theme().colors().surface_background)
             .shadow_lg()
             .when_some(self.icon.clone(), |this, icon| this.child(icon))
-            .child(Label::new(self.text.clone()).color(Color::Default))
+            .child(
+                Label::new(self.text.clone())
+                    .color(Color::Default)
+                    .truncate_middle(),
+            )
             .when_some(self.action.as_ref(), |this, action| {
                 this.child(
                     Button::new(action.id.clone(), action.label.clone())

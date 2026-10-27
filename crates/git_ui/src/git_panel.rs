@@ -14728,6 +14728,52 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_push_toast_with_long_branch_name_fits_window(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/project"), json!({ ".git": {}, "file": "content" }))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let window_width = px(600.);
+        cx.simulate_resize(gpui::size(window_width, px(400.)));
+        let panel = workspace.update_in(cx, GitPanel::new);
+
+        let branch_name = format!("feature/{}", "very-long-branch-name-".repeat(20));
+        panel.update(cx, |panel, cx| {
+            panel.show_remote_output(
+                RemoteAction::Push(
+                    branch_name.into(),
+                    Remote {
+                        name: "origin".into(),
+                    },
+                ),
+                RemoteCommandOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let dismiss_button = cx
+            .debug_bounds("ICON-Close")
+            .expect("push toast should have a dismiss button");
+        assert!(
+            dismiss_button.right() <= window_width,
+            "the toast's buttons should stay inside the window, but the dismiss button ends at {:?}",
+            dismiss_button.right()
+        );
+    }
+
+    #[gpui::test]
     async fn test_dispatch_context_with_focus_states(cx: &mut TestAppContext) {
         init_test(cx);
 
