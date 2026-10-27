@@ -242,6 +242,7 @@ impl Render for ToastLayer {
                 .child(
                     h_flex()
                         .id("active-toast-container")
+                        .max_w_full()
                         .occlude()
                         .on_hover(cx.listener(|this, hover_start, _window, cx| {
                             if *hover_start {
