@@ -3108,6 +3108,27 @@ impl GitPanel {
         self.revert_entries(targets, action.skip_prompt, window, cx);
     }
 
+    fn discard_section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.active_repository.clone() else {
+            return;
+        };
+        let scope = if section == Section::Unstaged {
+            DiscardScope::Unstaged
+        } else {
+            DiscardScope::All
+        };
+        let header = GitHeaderEntry { header: section };
+        let targets = {
+            let repo = repo.read(cx);
+            self.change_entries
+                .iter()
+                .filter(|entry| header.contains(entry, repo))
+                .map(|entry| DiscardTarget::new(entry.clone(), scope))
+                .collect::<Vec<_>>()
+        };
+        self.revert_entries(targets, false, window, cx);
+    }
+
     /// The files a discard acts on, mirroring `effective_status_entries`.
     ///
     /// A partially staged file has a row in both the "Staged" and "Unstaged"
@@ -8826,7 +8847,7 @@ impl GitPanel {
 
         h_flex()
             .id(id)
-            .group(group_name)
+            .group(group_name.clone())
             .h(self.list_item_height())
             .w_full()
             .pl_2p5()
@@ -8855,6 +8876,32 @@ impl GitPanel {
                             .color(Color::Muted)
                             .size(LabelSize::Small),
                     ),
+            )
+            .when(
+                !section_is_empty && matches!(section, Section::Staged | Section::Unstaged),
+                |this| {
+                    let discard_weak = weak.clone();
+                    let tooltip = if section == Section::Staged {
+                        "Discard All Changes to Staged Files"
+                    } else {
+                        "Discard Unstaged Changes"
+                    };
+                    this.child(
+                        IconButton::new(("discard-section", ix), IconName::RotateCcw)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .disabled(!has_write_access)
+                            .visible_on_hover(group_name.clone())
+                            .tooltip(Tooltip::text(tooltip))
+                            .on_click(move |_, window, cx| {
+                                discard_weak
+                                    .update(cx, |this, cx| {
+                                        this.discard_section(section, window, cx);
+                                    })
+                                    .ok();
+                            }),
+                    )
+                },
             )
             .when(file_count > 0, |this| {
                 this.child(Chip::new(file_count.to_string()).label_color(Color::Muted))
@@ -16589,6 +16636,55 @@ mod tests {
 
         // Discarding from the "Staged" section restores HEAD.
         discard_row(&panel, "partial.txt", Section::Staged, &mut cx);
+        await_git_panel_entries(&panel, &mut cx).await;
+        assert_eq!(
+            worktree_and_index(&fs, "partial.txt").await,
+            ("head\n".into(), Some("head\n".into()))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_discard_section(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (fs, panel, mut cx) = setup_git_panel_with_index_contents(
+            cx,
+            &[("partial.txt", "head\n"), ("modified.txt", "head\n")],
+            &[("partial.txt", "staged\n"), ("modified.txt", "head\n")],
+            json!({
+                ".git": {},
+                "partial.txt": "unstaged\n",
+                "modified.txt": "changed\n",
+                "untracked.txt": "new\n",
+            }),
+        )
+        .await;
+
+        // Discarding the "Unstaged" section keeps staged changes and trashes
+        // untracked files.
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.discard_section(Section::Unstaged, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Discard and Trash");
+        cx.run_until_parked();
+        await_git_panel_entries(&panel, &mut cx).await;
+        assert_eq!(
+            worktree_and_index(&fs, "partial.txt").await,
+            ("staged\n".into(), Some("staged\n".into()))
+        );
+        assert_eq!(
+            worktree_and_index(&fs, "modified.txt").await,
+            ("head\n".into(), Some("head\n".into()))
+        );
+        assert!(!fs.is_file(path!("/project/untracked.txt").as_ref()).await);
+
+        // Discarding the "Staged" section restores HEAD.
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.discard_section(Section::Staged, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Discard Changes");
+        cx.run_until_parked();
         await_git_panel_entries(&panel, &mut cx).await;
         assert_eq!(
             worktree_and_index(&fs, "partial.txt").await,
