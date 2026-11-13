@@ -2496,6 +2496,96 @@ async fn test_copy_and_cut_write_to_system_clipboard(cx: &mut gpui::TestAppConte
 }
 
 #[gpui::test]
+async fn test_copy_media_writes_file_paths_to_system_clipboard(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "clip.mp4": "",
+            "notes.txt": "",
+            "photo.png": "",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let copy_and_read_external_paths = |path: &str, cx: &mut VisualTestContext| {
+        select_path(&panel, path, cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.copy(&Default::default(), window, cx);
+        });
+        let clipboard = cx
+            .read_from_clipboard()
+            .expect("clipboard should have content after copy");
+        let text = clipboard.text().expect("clipboard should contain text");
+        assert!(
+            text.ends_with(path.trim_start_matches("root/")),
+            "clipboard text should still be the path, got: {text}"
+        );
+        clipboard.entries().iter().find_map(|entry| match entry {
+            GpuiClipboardEntry::ExternalPaths(paths) => Some(paths.paths().to_vec()),
+            _ => None,
+        })
+    };
+
+    assert_eq!(
+        copy_and_read_external_paths("root/photo.png", cx),
+        Some(vec![PathBuf::from(path!("/root/photo.png"))])
+    );
+    assert_eq!(
+        copy_and_read_external_paths("root/clip.mp4", cx),
+        Some(vec![PathBuf::from(path!("/root/clip.mp4"))])
+    );
+    assert_eq!(copy_and_read_external_paths("root/notes.txt", cx), None);
+}
+
+#[gpui::test]
+async fn test_paste_copied_media_uses_internal_clipboard(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "photo.png": "",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    select_path(&panel, "root/photo.png", cx);
+    panel.update_in(cx, |panel, window, cx| {
+        panel.copy(&Default::default(), window, cx);
+        panel.paste(&Default::default(), window, cx);
+    });
+    cx.executor().run_until_parked();
+
+    assert!(
+        fs.is_file(Path::new(path!("/root/photo copy.png"))).await,
+        "pasting a copied image next to itself should create a copy, not replace it"
+    );
+    assert!(fs.is_file(Path::new(path!("/root/photo.png"))).await);
+}
+
+#[gpui::test]
 async fn test_open_svg_preview_for_single_file_worktree(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 

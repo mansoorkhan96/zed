@@ -19,10 +19,10 @@ use git::status::GitSummary;
 use git_ui_core::file_diff_view::FileDiffView;
 use gpui::{
     Action, Anchor, AnyElement, App, AsyncWindowContext, Bounds,
-    ClipboardEntry as GpuiClipboardEntry, ClipboardItem, Context, CursorStyle, DismissEvent, Div,
-    DragMoveEvent, Entity, EventEmitter, ExternalDragPayload, ExternalPaths, FileDragPaths,
-    FileDropEvent, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, KeyContext,
-    ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
+    ClipboardEntry as GpuiClipboardEntry, ClipboardItem, ClipboardString, Context, CursorStyle,
+    DismissEvent, Div, DragMoveEvent, Entity, EventEmitter, ExternalDragPayload, ExternalPaths,
+    FileDragPaths, FileDropEvent, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement,
+    KeyContext, ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, ParentElement, PathPromptOptions, Pixels, Point,
     PromptLevel, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
     UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, div, hsla,
@@ -37,6 +37,7 @@ use project::{
     Entry, EntryKind, Fs, GitEntry, GitEntryRef, GitTraversal, Project, ProjectEntryId,
     ProjectPath, Worktree, WorktreeId,
     git_store::{GitStoreEvent, RepositoryEvent, git_traversal::ChildEntriesGitIter},
+    image_store::is_image_file,
     project_settings::GoToDiagnosticSeverityFilter,
 };
 use project_panel_settings::ProjectPanelSettings;
@@ -93,6 +94,7 @@ use crate::{
 
 const PROJECT_PANEL_KEY: &str = "ProjectPanel";
 const NEW_ENTRY_ID: ProjectEntryId = ProjectEntryId::MAX;
+const VIDEO_EXTENSIONS: &[&str] = &["avi", "m4v", "mkv", "mov", "mp4", "webm", "wmv"];
 
 struct VisibleEntriesForWorktree {
     worktree_id: WorktreeId,
@@ -3588,7 +3590,7 @@ impl ProjectPanel {
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
         let entries = self.disjoint_effective_entries_excluding_roots(cx);
         if !entries.is_empty() {
-            self.write_entries_to_system_clipboard(&entries, cx);
+            self.write_entries_to_system_clipboard(&entries, false, cx);
             self.clipboard = Some(ClipboardEntry::Cut(entries));
             cx.notify();
         }
@@ -3597,7 +3599,7 @@ impl ProjectPanel {
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         let entries = self.disjoint_effective_entries_excluding_roots(cx);
         if !entries.is_empty() {
-            self.write_entries_to_system_clipboard(&entries, cx);
+            self.write_entries_to_system_clipboard(&entries, true, cx);
             self.clipboard = Some(ClipboardEntry::Copied(entries));
             cx.notify();
         }
@@ -3668,7 +3670,9 @@ impl ProjectPanel {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(external_paths) = self.external_paths_from_system_clipboard(cx) {
+        if let Some(external_paths) = self.external_paths_from_system_clipboard(cx)
+            && !self.system_clipboard_matches_internal(external_paths.paths(), cx)
+        {
             let target_entry_id = self
                 .selection
                 .map(|s| s.entry_id)
@@ -4495,26 +4499,78 @@ impl ProjectPanel {
         Some(worktree.absolutize(&root_entry.path))
     }
 
-    fn write_entries_to_system_clipboard(&self, entries: &BTreeSet<SelectedEntry>, cx: &mut App) {
-        let project = self.project.read(cx);
-        let paths: Vec<String> = entries
+    fn write_entries_to_system_clipboard(
+        &self,
+        entries: &BTreeSet<SelectedEntry>,
+        include_media_files: bool,
+        cx: &mut App,
+    ) {
+        let paths: Vec<PathBuf> = entries
             .iter()
-            .filter_map(|entry| {
-                let worktree = project.worktree_for_id(entry.worktree_id, cx)?;
-                let worktree = worktree.read(cx);
-                let worktree_entry = worktree.entry_for_id(entry.entry_id)?;
-                Some(
-                    worktree
-                        .abs_path()
-                        .join(worktree_entry.path.as_std_path())
-                        .to_string_lossy()
-                        .to_string(),
-                )
-            })
+            .filter_map(|entry| self.entry_abs_path(entry, cx))
             .collect();
-        if !paths.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(paths.join("\n")));
+        if paths.is_empty() {
+            return;
         }
+        let text = paths.iter().map(|path| path.to_string_lossy()).join("\n");
+        // Image and video files also go on the clipboard as files, so they can be
+        // pasted into other apps like Finder or a browser.
+        let item =
+            if include_media_files && entries.iter().all(|entry| self.is_media_file(entry, cx)) {
+                ClipboardItem {
+                    entries: vec![
+                        GpuiClipboardEntry::ExternalPaths(ExternalPaths(paths.into())),
+                        GpuiClipboardEntry::String(ClipboardString::new(text)),
+                    ],
+                }
+            } else {
+                ClipboardItem::new_string(text)
+            };
+        cx.write_to_clipboard(item);
+    }
+
+    fn entry_abs_path(&self, entry: &SelectedEntry, cx: &App) -> Option<PathBuf> {
+        let worktree = self
+            .project
+            .read(cx)
+            .worktree_for_id(entry.worktree_id, cx)?;
+        let worktree = worktree.read(cx);
+        let worktree_entry = worktree.entry_for_id(entry.entry_id)?;
+        Some(worktree.abs_path().join(worktree_entry.path.as_std_path()))
+    }
+
+    fn is_media_file(&self, entry: &SelectedEntry, cx: &App) -> bool {
+        let Some(worktree) = self.project.read(cx).worktree_for_id(entry.worktree_id, cx) else {
+            return false;
+        };
+        let Some(worktree_entry) = worktree.read(cx).entry_for_id(entry.entry_id) else {
+            return false;
+        };
+        if !worktree_entry.is_file() {
+            return false;
+        }
+        let is_video = worktree_entry
+            .path
+            .extension()
+            .is_some_and(|extension| VIDEO_EXTENSIONS.contains(&extension.to_lowercase().as_str()));
+        let project_path = ProjectPath {
+            worktree_id: entry.worktree_id,
+            path: worktree_entry.path.clone(),
+        };
+        is_video || is_image_file(&self.project, &project_path, cx)
+    }
+
+    /// Whether the system clipboard holds exactly the files this panel copied, which
+    /// happens when copying image or video files.
+    fn system_clipboard_matches_internal(&self, paths: &[PathBuf], cx: &App) -> bool {
+        self.clipboard.as_ref().is_some_and(|clipboard| {
+            let internal_paths = clipboard
+                .items()
+                .iter()
+                .filter_map(|entry| self.entry_abs_path(entry, cx))
+                .collect::<Vec<_>>();
+            internal_paths == paths
+        })
     }
 
     fn external_paths_from_system_clipboard(&self, cx: &App) -> Option<ExternalPaths> {
