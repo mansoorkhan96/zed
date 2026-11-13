@@ -160,6 +160,15 @@ impl Pasteboard {
     }
 
     pub fn write(&self, item: ClipboardItem) {
+        if let Some(paths) = item.entries.iter().find_map(|entry| match entry {
+            ClipboardEntry::ExternalPaths(paths) => Some(paths.paths()),
+            _ => None,
+        }) {
+            let text = item.text().unwrap_or_default();
+            self.write_external_paths(paths, &text);
+            return;
+        }
+
         match item.entries.as_slice() {
             [] => {
                 // Writing an empty list of entries just clears the clipboard.
@@ -171,7 +180,6 @@ impl Pasteboard {
             [ClipboardEntry::Image(image)] => {
                 self.write_image(image);
             }
-            [ClipboardEntry::ExternalPaths(_)] => {}
             _ => {
                 // Agus NB: We're currently only writing string entries to the clipboard when we have more than one.
                 //
@@ -220,6 +228,36 @@ impl Pasteboard {
                 self.inner
                     .setData_forType(Some(&metadata_bytes), &self.metadata_type);
             }
+        }
+    }
+
+    /// Writes the paths as files, the way Finder copies them, along with `text` so
+    /// text fields can still paste them.
+    fn write_external_paths(&self, paths: &[PathBuf], text: &str) {
+        let ns_paths = paths
+            .iter()
+            .map(|path| NSString::from_str(&path.to_string_lossy()))
+            .collect::<Vec<_>>();
+        let ns_paths = NSArray::from_retained_slice(&ns_paths);
+
+        unsafe {
+            #[expect(
+                deprecated,
+                reason = "Preserve the existing file-copy pasteboard format"
+            )]
+            let types = NSArray::from_slice(&[NSFilenamesPboardType, NSPasteboardTypeString]);
+            self.inner.declareTypes_owner(&types, None);
+
+            #[expect(
+                deprecated,
+                reason = "Preserve the existing file-copy pasteboard format"
+            )]
+            self.inner
+                .setPropertyList_forType(&ns_paths, NSFilenamesPboardType);
+
+            let text_bytes = NSData::with_bytes(text.as_bytes());
+            self.inner
+                .setData_forType(Some(&text_bytes), NSPasteboardTypeString);
         }
     }
 
@@ -361,6 +399,33 @@ mod tests {
         };
         autoreleasepool(|_| pasteboard.write(item.clone()));
         assert_eq!(autoreleasepool(|_| pasteboard.read()), Some(item));
+    }
+
+    #[test]
+    fn test_write_external_paths() {
+        let pasteboard = Pasteboard::unique();
+        let paths = vec![
+            PathBuf::from("/photo.png"),
+            PathBuf::from("/clip with space.mp4"),
+        ];
+        let text = "/photo.png\n/clip with space.mp4";
+        let item = ClipboardItem {
+            entries: vec![
+                ClipboardEntry::ExternalPaths(ExternalPaths(paths.clone().into())),
+                ClipboardEntry::String(ClipboardString::new(text.to_string())),
+            ],
+        };
+
+        autoreleasepool(|_| pasteboard.write(item));
+        let read = autoreleasepool(|_| pasteboard.read()).expect("should read clipboard item");
+
+        match &read.entries[0] {
+            ClipboardEntry::ExternalPaths(external_paths) => {
+                assert_eq!(external_paths.paths(), paths.as_slice());
+            }
+            other => panic!("expected ExternalPaths, got {other:?}"),
+        }
+        assert_eq!(read.text().as_deref(), Some(text));
     }
 
     #[test]
