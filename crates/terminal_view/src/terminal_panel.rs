@@ -32,7 +32,7 @@ use workspace::{
     MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, Pane,
     PaneGroup, SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown,
     SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleZoom, Workspace,
-    dock::{DockPosition, Panel, PanelEvent, PanelHandle},
+    dock::{DockPosition, Panel, PanelEvent},
     item::SerializableItem,
     move_active_item, pane,
 };
@@ -407,7 +407,11 @@ impl TerminalPanel {
             .update_in(cx, |workspace, window, cx| {
                 !workspace.has_active_modal(window, cx)
                     && terminal_panel.upgrade().is_some_and(|terminal_panel| {
-                        workspace.active_item(cx).is_none()
+                        let terminal_panel = terminal_panel.read(cx);
+                        // A zoomed terminal covers the center items, so leaving focus on
+                        // one of them would send typing to something the user can't see.
+                        (workspace.active_item(cx).is_none()
+                            || terminal_panel.is_zoomed(window, cx))
                             && workspace
                                 .is_dock_at_position_open(terminal_panel.position(window, cx), cx)
                     })
@@ -1882,7 +1886,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use project::FakeFs;
     use settings::SettingsStore;
-    use workspace::{MultiWorkspace, WorkspaceId};
+    use workspace::{MultiWorkspace, WorkspaceId, item::test::TestItem};
 
     #[test]
     fn test_prepare_empty_task() {
@@ -2759,6 +2763,72 @@ mod tests {
             assert!(
                 terminal_view.focus_handle(cx).contains_focused(window, cx),
                 "with no modal open, a new task terminal should take focus"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_finished_restoration_focuses_zoomed_terminal_over_center_item(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let workspace = window_handle
+            .update(cx, |multi_workspace, _, _| {
+                multi_workspace.workspace().clone()
+            })
+            .expect("Failed to read workspace");
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        terminal_panel
+            .update_in(cx, |terminal_panel, window, cx| {
+                terminal_panel.add_terminal_shell(false, None, RevealStrategy::Never, window, cx)
+            })
+            .await
+            .expect("Failed to spawn a panel terminal");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_panel::<TerminalPanel>(window, cx);
+            terminal_panel.update(cx, |terminal_panel, cx| {
+                terminal_panel.set_zoomed(true, window, cx);
+            });
+            let item = cx.new(TestItem::new);
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(
+                workspace.active_item(cx).is_some()
+                    && terminal_panel.read(cx).is_zoomed(window, cx),
+                "a zoomed terminal panel over an open center item is the case under test"
+            );
+        });
+
+        window_handle
+            .update(cx, |_, window, cx| {
+                let workspace = workspace.downgrade();
+                let terminal_panel = terminal_panel.downgrade();
+                window.spawn(cx, async move |cx| {
+                    TerminalPanel::restore_serialized_state(workspace, terminal_panel, cx).await
+                })
+            })
+            .expect("Failed to restore serialized state")
+            .await
+            .expect("Failed to restore serialized state");
+        cx.run_until_parked();
+
+        terminal_panel.update_in(cx, |terminal_panel, window, cx| {
+            let terminal_view = terminal_panel
+                .active_pane
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<TerminalView>())
+                .expect("the restored terminal should be the active panel item");
+            assert!(
+                terminal_view.focus_handle(cx).contains_focused(window, cx),
+                "a zoomed terminal covers the center items, so it should get focus after restore"
             );
         });
     }
