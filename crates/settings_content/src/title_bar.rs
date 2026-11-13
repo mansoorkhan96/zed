@@ -78,6 +78,29 @@ impl From<String> for WindowButtonLayoutContent {
     }
 }
 
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleBarVisibility {
+    /// Always show the title bar.
+    Always,
+    /// Never show the title bar.
+    Never,
+    /// Show the title bar, but hide it while the window is in full screen.
+    HideInFullScreen,
+}
+
 /// How the active file is shown in the title bar.
 #[derive(
     Copy,
@@ -109,6 +132,10 @@ pub enum ShowActiveFile {
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
 pub struct TitleBarSettingsContent {
+    /// When to show the title bar.
+    ///
+    /// Default: always
+    pub show: Option<TitleBarVisibility>,
     /// Whether to show git status indicators on the branch icon in the title bar.
     /// When enabled, the branch icon changes to reflect the current repository
     /// status (e.g. modified, added, deleted, or conflict).
