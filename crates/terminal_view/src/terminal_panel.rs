@@ -407,13 +407,10 @@ impl TerminalPanel {
             .update_in(cx, |workspace, window, cx| {
                 !workspace.has_active_modal(window, cx)
                     && terminal_panel.upgrade().is_some_and(|terminal_panel| {
+                        // Which part of the window had focus isn't saved, so a terminal
+                        // that was left open is assumed to be where the user was typing.
                         let terminal_panel = terminal_panel.read(cx);
-                        // A zoomed terminal covers the center items, so leaving focus on
-                        // one of them would send typing to something the user can't see.
-                        (workspace.active_item(cx).is_none()
-                            || terminal_panel.is_zoomed(window, cx))
-                            && workspace
-                                .is_dock_at_position_open(terminal_panel.position(window, cx), cx)
+                        workspace.is_dock_at_position_open(terminal_panel.position(window, cx), cx)
                     })
             })
             .unwrap_or(false);
@@ -2768,7 +2765,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_finished_restoration_focuses_zoomed_terminal_over_center_item(
+    async fn test_finished_restoration_focuses_open_terminal_over_center_item(
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
@@ -2790,9 +2787,6 @@ mod tests {
             .expect("Failed to spawn a panel terminal");
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.open_panel::<TerminalPanel>(window, cx);
-            terminal_panel.update(cx, |terminal_panel, cx| {
-                terminal_panel.set_zoomed(true, window, cx);
-            });
             let item = cx.new(TestItem::new);
             workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
         });
@@ -2801,8 +2795,10 @@ mod tests {
         workspace.update_in(cx, |workspace, window, cx| {
             assert!(
                 workspace.active_item(cx).is_some()
-                    && terminal_panel.read(cx).is_zoomed(window, cx),
-                "a zoomed terminal panel over an open center item is the case under test"
+                    && !terminal_panel.read(cx).is_zoomed(window, cx)
+                    && workspace
+                        .is_dock_at_position_open(terminal_panel.read(cx).position(window, cx), cx),
+                "an open, unzoomed terminal panel next to an open center item is the case under test"
             );
         });
 
@@ -2828,7 +2824,7 @@ mod tests {
                 .expect("the restored terminal should be the active panel item");
             assert!(
                 terminal_view.focus_handle(cx).contains_focused(window, cx),
-                "a zoomed terminal covers the center items, so it should get focus after restore"
+                "an open terminal panel should get focus after restore, even with center items open"
             );
         });
     }
